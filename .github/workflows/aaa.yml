@@ -1,0 +1,194 @@
+name: Build Tweaked App
+
+on:
+  workflow_dispatch:
+    inputs:
+      tweak_name:
+        description: "Tweak to apply"
+        required: true
+        type: choice
+        options:
+          - tweak-a
+          - tweak-b
+          - tweak-c
+      app_version:
+        description: "App version (leave empty for latest)"
+        required: false
+        type: string
+      force_rebuild:
+        description: "Force rebuild even if exists"
+        required: false
+        type: boolean
+        default: false
+
+env:
+  UPLOADS_REPO: "your-org/ios-apps-uploads"
+  APP_NAME: "YourApp" # Base app name
+
+jobs:
+  build-tweaked-app:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout main repo
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Load tweak configuration
+        id: config
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const config = JSON.parse(fs.readFileSync('.github/tweaks-config.json', 'utf8'));
+            const tweak = config.tweaks.find(t => t.id === '${{ inputs.tweak_name }}');
+
+            if (!tweak) {
+              core.setFailed(`Tweak ${context.payload.inputs.tweak_name} not found in config`);
+              return;
+            }
+
+            core.setOutput('fork_repo', tweak.forkRepo);
+            core.setOutput('upstream_repo', tweak.upstreamRepo);
+            core.setOutput('workflow_file', tweak.workflowFile);
+            core.setOutput('workflow_inputs', JSON.stringify(tweak.defaultInputs || {}));
+            core.setOutput('app_name', tweak.appName);
+            return tweak;
+
+      - name: Check fork sync status
+        uses: actions/github-script@v7
+        env:
+          FORK_REPO: ${{ steps.config.outputs.fork_repo }}
+          UPSTREAM_REPO: ${{ steps.config.outputs.upstream_repo }}
+        with:
+          github-token: ${{ secrets.PAT_TOKEN }}
+          script: |
+            const [forkOwner, forkName] = process.env.FORK_REPO.split('/');
+            const [upstreamOwner, upstreamName] = process.env.UPSTREAM_REPO.split('/');
+
+            // Get default branches
+            const fork = await github.rest.repos.get({
+              owner: forkOwner,
+              repo: forkName
+            });
+
+            const upstream = await github.rest.repos.get({
+              owner: upstreamOwner,
+              repo: upstreamName
+            });
+
+            // Compare commits
+            const comparison = await github.rest.repos.compareCommitsWithBasehead({
+              owner: upstreamOwner,
+              repo: upstreamName,
+              basehead: `${fork.data.default_branch}...${upstream.data.default_branch}`
+            });
+
+            if (comparison.data.behind_by > 0) {
+              core.setFailed(
+                `Fork is ${comparison.data.behind_by} commits behind upstream. ` +
+                `Please sync the fork first at https://github.com/${process.env.FORK_REPO}`
+              );
+            } else {
+              console.log('✓ Fork is up to date with upstream');
+            }
+
+      - name: Find decrypted app release
+        id: find_app
+        uses: actions/github-script@v7
+        env:
+          APP_VERSION: ${{ inputs.app_version }}
+          APP_NAME: ${{ steps.config.outputs.app_name }}
+        with:
+          github-token: ${{ secrets.PAT_TOKEN }}
+          script: |
+            const script = require('./.github/scripts/find-decrypted-app.js');
+            return await script({github, context, core});
+
+      - name: Dispatch tweak workflow
+        id: dispatch
+        uses: actions/github-script@v7
+        env:
+          FORK_REPO: ${{ steps.config.outputs.fork_repo }}
+          WORKFLOW_FILE: ${{ steps.config.outputs.workflow_file }}
+          DOWNLOAD_URL: ${{ steps.find_app.outputs.download_url }}
+          WORKFLOW_INPUTS: ${{ steps.config.outputs.workflow_inputs }}
+        with:
+          github-token: ${{ secrets.PAT_TOKEN }}
+          script: |
+            const script = require('./.github/scripts/dispatch-tweak-workflow.js');
+            return await script({github, context, core});
+
+      - name: Wait for workflow completion
+        id: wait
+        uses: actions/github-script@v7
+        env:
+          FORK_REPO: ${{ steps.config.outputs.fork_repo }}
+          RUN_ID: ${{ steps.dispatch.outputs.run_id }}
+        with:
+          github-token: ${{ secrets.PAT_TOKEN }}
+          script: |
+            const script = require('./.github/scripts/wait-for-workflow.js');
+            return await script({github, context, core});
+
+      - name: Download tweaked app
+        id: download
+        uses: actions/github-script@v7
+        env:
+          FORK_REPO: ${{ steps.config.outputs.fork_repo }}
+        with:
+          github-token: ${{ secrets.PAT_TOKEN }}
+          script: |
+            const script = require('./.github/scripts/download-tweaked-app.js');
+            return await script({github, context, core});
+
+      - name: Upload to releases repo
+        uses: actions/github-script@v7
+        env:
+          APP_VERSION: ${{ steps.find_app.outputs.app_version }}
+          TWEAK_NAME: ${{ inputs.tweak_name }}
+          TWEAK_VERSION: ${{ steps.download.outputs.tweak_version }}
+          FILE_PATH: ${{ steps.download.outputs.file_path }}
+          FILE_NAME: ${{ steps.download.outputs.file_name }}
+        with:
+          github-token: ${{ secrets.PAT_TOKEN }}
+          script: |
+            const script = require('./.github/scripts/upload-to-releases.js');
+            return await script({github, context, core});
+
+      - name: Trigger JSON generation
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.PAT_TOKEN }}
+          script: |
+            const [owner, repo] = '${{ env.UPLOADS_REPO }}'.split('/');
+
+            await github.rest.actions.createWorkflowDispatch({
+              owner,
+              repo,
+              workflow_id: 'generate-manifest.yml',
+              ref: 'main'
+            });
+
+            console.log('✓ Triggered manifest generation workflow');
+
+      - name: Summary
+        if: success()
+        run: |
+          echo "## ✅ Build Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **App Version:** ${{ steps.find_app.outputs.app_version }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Tweak:** ${{ inputs.tweak_name }} v${{ steps.download.outputs.tweak_version }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **File:** ${{ steps.download.outputs.file_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "The manifest will be updated shortly."

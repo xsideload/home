@@ -1,21 +1,7 @@
-```txt
-npm install
-npm run dev
-```
+# xsideload
 
-```txt
-npm run deploy
-```
+## Release Pattern
 
-[For generating/synchronizing types based on your Worker configuration run](https://developers.cloudflare.com/workers/wrangler/commands/#types):
-
-```txt
-npm run cf-typegen
-```
-
-Pass the `CloudflareBindings` as generics when instantiation `Hono`:
-
-```ts
-// src/index.ts
-const app = new Hono<{ Bindings: CloudflareBindings }>()
-```
+- tag_name = AppName_AppVersion
+  - decrypted app = AppName_AppVersion.ipa
+  - tweaked app(s) = AppName_AppVersion_TweakName_TweakVersion_OptionalNotes.ipa
